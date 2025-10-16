@@ -1,338 +1,903 @@
-/* Titanic Binary Classifier — TensorFlow.js (Browser)
- * Target: Survived (0/1)
- * Features: Pclass, Sex, Age, SibSp, Parch, Fare, Embarked
- * Exclude: PassengerId
- * Notes: robust CSV parser (handles quotes/commas), tfjs-vis charts, ROC/AUC.
- */
+// Global variables
+let trainData = null;
+let testData = null;
+let model = null;
+let trainingHistory = null;
+let validationData = null;
+let testPredictions = null;
+let rocData = null;
 
-// ---------- DOM ----------
-const els = {
-  trainFile: document.getElementById('trainFile'),
-  testFile: document.getElementById('testFile'),
-  btnLoad: document.getElementById('btnLoad'),
-  previewMeta: document.getElementById('previewMeta'),
-  previewTable: document.getElementById('previewTable'),
-  loadInfo: document.getElementById('loadInfo'),
-
-  toggleFamily: document.getElementById('toggleFamily'),
-  btnPreprocess: document.getElementById('btnPreprocess'),
-  prepInfo: document.getElementById('prepInfo'),
-
-  btnBuild: document.getElementById('btnBuild'),
-  visModel: document.getElementById('visModel'),
-  modelSummary: document.getElementById('modelSummary'),
-  btnTrain: document.getElementById('btnTrain'),
-  btnEvaluate: document.getElementById('btnEvaluate'),
-  visFit: document.getElementById('visFit'),
-  trainInfo: document.getElementById('trainInfo'),
-
-  thrSlider: document.getElementById('thrSlider'),
-  thrVal: document.getElementById('thrVal'),
-  btnUpdateThr: document.getElementById('btnUpdateThr'),
-  cmStats: document.getElementById('cmStats'),
-  prfStats: document.getElementById('prfStats'),
-  visROC: document.getElementById('visROC'),
-  aucInfo: document.getElementById('aucInfo'),
-
-  btnPredict: document.getElementById('btnPredict'),
-  btnSaveModel: document.getElementById('btnSaveModel'),
-  predInfo: document.getElementById('predInfo'),
-  btnExportSubmission: document.getElementById('btnExportSubmission'),
-  btnExportProbs: document.getElementById('btnExportProbs'),
-
-  visSex: document.getElementById('visSex'),
-  visPclass: document.getElementById('visPclass'),
+// DOM elements
+const elements = {
+    loadBtn: document.getElementById('load-btn'),
+    preprocessBtn: document.getElementById('preprocess-btn'),
+    buildModelBtn: document.getElementById('build-model-btn'),
+    trainBtn: document.getElementById('train-btn'),
+    predictBtn: document.getElementById('predict-btn'),
+    downloadBtn: document.getElementById('download-btn'),
+    saveModelBtn: document.getElementById('save-model-btn'),
+    thresholdSlider: document.getElementById('threshold-slider'),
+    thresholdValue: document.getElementById('threshold-value')
 };
 
-// ---------- Globals ----------
-let rawTrain=null, rawTest=null;
-let X=null, y=null, featureNames=[];
-let medians={}, modes={}, scalers={};
-let useFamily=true;
-let model=null, split={}, valProbs=null, valTrue=null, roc=null, threshold=0.5;
-let testProbs=null, submission=null, probabilities=null;
-
-// ---------- CSV (fixed: quotes/commas) ----------
-function parseCSV(text){
-  const rows=[]; let i=0, field='', inQuotes=false, row=[];
-  const pushField=()=>{ row.push(field); field=''; };
-  const pushRow =()=>{ if(row.length){ rows.push(row); row=[]; }};
-
-  while(i<text.length){
-    const c=text[i];
-    if(inQuotes){
-      if(c === '"'){ if(text[i+1] === '"'){ field+='"'; i++; } else { inQuotes=false; } }
-      else field+=c;
-    } else {
-      if(c === '"') inQuotes=true;
-      else if(c === ',') pushField();
-      else if(c === '\n' || c === '\r'){ if(c==='\r' && text[i+1]==='\n') i++; pushField(); pushRow(); }
-      else field+=c;
+// Robust CSV parser that handles quoted fields and commas
+function parseCSV(csvText) {
+    const rows = [];
+    let currentRow = [];
+    let currentField = '';
+    let inQuotes = false;
+    
+    for (let i = 0; i < csvText.length; i++) {
+        const char = csvText[i];
+        const nextChar = csvText[i + 1] || '';
+        
+        if (char === '"') {
+            if (inQuotes && nextChar === '"') {
+                // Escaped quote inside quotes
+                currentField += '"';
+                i++; // Skip next quote
+            } else {
+                // Toggle quote state
+                inQuotes = !inQuotes;
+            }
+        } else if (char === ',' && !inQuotes) {
+            // End of field
+            currentRow.push(currentField);
+            currentField = '';
+        } else if ((char === '\n' || char === '\r') && !inQuotes) {
+            // Handle line endings
+            if (char === '\r' && nextChar === '\n') i++; // Skip \n after \r
+            // End of row
+            if (currentField !== '' || currentRow.length > 0) {
+                currentRow.push(currentField);
+                rows.push(currentRow);
+            }
+            currentRow = [];
+            currentField = '';
+        } else {
+            currentField += char;
+        }
     }
-    i++;
-  }
-  if(field.length || row.length){ pushField(); pushRow(); }
-  while(rows.length && rows[rows.length-1].every(v=>v==='')) rows.pop();
+    
+    // Add final row if exists
+    if (currentField !== '' || currentRow.length > 0) {
+        currentRow.push(currentField);
+        rows.push(currentRow);
+    }
+    
+    return rows;
+}
 
-  const header = rows.shift().map(h=>h.trim());
-  return rows.map(r=>{
-    const o={};
-    header.forEach((h,idx)=>{
-      const v = r[idx]===undefined || r[idx]==='' ? null : r[idx];
-      o[h] = (v!==null && !isNaN(v)) ? Number(v) : v; // numeric if possible
+// File loading and inspection
+elements.loadBtn.addEventListener('click', async () => {
+    const trainFile = document.getElementById('train-file').files[0];
+    const testFile = document.getElementById('test-file').files[0];
+    
+    if (!trainFile) {
+        alert('Please select a training CSV file');
+        return;
+    }
+    
+    try {
+        const trainText = await trainFile.text();
+        const trainRows = parseCSV(trainText);
+        
+        if (trainRows.length < 2) {
+            throw new Error('Training file is empty or invalid');
+        }
+        
+        const headers = trainRows[0];
+        const dataRows = trainRows.slice(1);
+        
+        // Convert to array of objects
+        trainData = dataRows.map(row => {
+            const obj = {};
+            headers.forEach((header, index) => {
+                obj[header.trim()] = row[index] ? row[index].trim() : '';
+            });
+            return obj;
+        });
+        
+        // Load test data if provided
+        if (testFile) {
+            const testText = await testFile.text();
+            const testRows = parseCSV(testText);
+            
+            if (testRows.length > 1) {
+                const testHeaders = testRows[0];
+                const testDataRows = testRows.slice(1);
+                
+                testData = testDataRows.map(row => {
+                    const obj = {};
+                    testHeaders.forEach((header, index) => {
+                        obj[header.trim()] = row[index] ? row[index].trim() : '';
+                    });
+                    return obj;
+                });
+            }
+        }
+        
+        displayDataPreview(trainData, testData);
+        calculateDataStats(trainData);
+        
+    } catch (error) {
+        alert('Error loading files: ' + error.message);
+        console.error(error);
+    }
+});
+
+function displayDataPreview(trainData, testData) {
+    const previewDiv = document.getElementById('data-preview');
+    previewDiv.innerHTML = '';
+    
+    // Training data preview
+    const trainPreview = document.createElement('div');
+    trainPreview.innerHTML = `<h3>Training Data Preview (${trainData.length} rows)</h3>`;
+    
+    if (trainData.length > 0) {
+        const sample = trainData.slice(0, 5);
+        const table = createTable(['#', ...Object.keys(sample[0])], 
+            sample.map((row, i) => [i + 1, ...Object.values(row)]));
+        trainPreview.appendChild(table);
+    }
+    
+    // Test data preview
+    if (testData) {
+        const testPreview = document.createElement('div');
+        testPreview.innerHTML = `<h3>Test Data Preview (${testData.length} rows)</h3>`;
+        
+        if (testData.length > 0) {
+            const sample = testData.slice(0, 5);
+            const table = createTable(['#', ...Object.keys(sample[0])], 
+                sample.map((row, i) => [i + 1, ...Object.values(row)]));
+            testPreview.appendChild(table);
+        }
+        previewDiv.appendChild(testPreview);
+    }
+    
+    previewDiv.appendChild(trainPreview);
+}
+
+function calculateDataStats(data) {
+    // Calculate missing values and basic stats
+    const stats = {};
+    const features = ['Pclass', 'Sex', 'Age', 'SibSp', 'Parch', 'Fare', 'Embarked', 'Survived'];
+    
+    features.forEach(feature => {
+        const values = data.map(row => row[feature]).filter(val => val !== '');
+        const missing = data.length - values.length;
+        
+        stats[feature] = {
+            missing: missing,
+            missingPercent: ((missing / data.length) * 100).toFixed(1),
+            unique: [...new Set(values)].length
+        };
     });
-    return o;
-  });
-}
-function readFile(inputEl){
-  return new Promise((resolve,reject)=>{
-    const file=inputEl.files?.[0];
-    if(!file) return resolve(null);
-    const reader=new FileReader();
-    reader.onload=()=>resolve(reader.result);
-    reader.onerror=e=>reject(e);
-    reader.readAsText(file);
-  });
-}
-
-// ---------- Helpers ----------
-function renderPreview(tableEl, rows, limit=12){
-  if(!rows?.length){ tableEl.innerHTML='<tr><td class="muted">No rows.</td></tr>'; return; }
-  const header=Object.keys(rows[0]);
-  const thead=`<thead><tr>${header.map(h=>`<th>${h}</th>`).join('')}</tr></thead>`;
-  const tbody=`<tbody>${rows.slice(0,limit).map(r=>`<tr>${header.map(h=>`<td>${String(r[h]??'').slice(0,80)}</td>`).join('')}</tr>`).join('')}</tbody>`;
-  tableEl.innerHTML=thead+tbody;
-}
-function missingPercent(rows, cols){
-  const total=rows.length; const out={};
-  for(const c of cols){ let m=0; for(const r of rows){ if(r[c]==null || r[c]==='') m++; } out[c]= total? (100*m/total):0; }
-  return out;
-}
-function median(arr){ const a=arr.filter(v=>v!=null && !Number.isNaN(v)).slice().sort((x,y)=>x-y); if(!a.length) return 0; const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
-function mode(arr){ const f=new Map(); let best=null,c=-1; for(const v of arr){ if(v==null || v==='') continue; f.set(v,(f.get(v)||0)+1); if(f.get(v)>c){c=f.get(v); best=v;} } return best; }
-function meanStd(arr){ const a=arr.filter(v=>v!=null && !Number.isNaN(v)); if(!a.length) return {mean:0,std:1}; const m=a.reduce((s,v)=>s+v,0)/a.length; const vv=a.reduce((s,v)=>s+(v-m)*(v-m),0)/Math.max(1,a.length-1); return {mean:m,std:Math.max(1e-8,Math.sqrt(vv))}; }
-function oneHot(val,cats){ const v=new Array(cats.length).fill(0); const idx=cats.indexOf(val); if(idx>=0) v[idx]=1; return v; }
-function confusion(yTrue,yProb,thr){ let TP=0,TN=0,FP=0,FN=0; for(let i=0;i<yTrue.length;i++){ const p=yProb[i]>=thr?1:0; const t=yTrue[i]; if(p===1&&t===1) TP++; else if(p===1&&t===0) FP++; else if(p===0&&t===0) TN++; else FN++; } return {TP,TN,FP,FN}; }
-function prf({TP,FP,FN}){ const precision=TP+FP===0?0:TP/(TP+FP); const recall=TP+FN===0?0:TP/(TP+FN); const f1=(precision+recall)===0?0:2*(precision*recall)/(precision+recall); return {precision,recall,f1}; }
-function computeROC(yTrue,yProb){ const steps=200; const pts=[]; for(let i=0;i<=steps;i++){ const thr=i/steps; let TP=0,TN=0,FP=0,FN=0; for(let j=0;j<yTrue.length;j++){ const p=yProb[j]>=thr?1:0; const t=yTrue[j]; if(p===1&&t===1) TP++; else if(p===1&&t===0) FP++; else if(p===0&&t===0) TN++; else FN++; } const TPR=TP+FN?TP/(TP+FN):0; const FPR=FP+TN?FP/(FP+TN):0; pts.push([FPR,TPR]); }
-  pts.sort((a,b)=>a[0]-b[0]); let auc=0; for(let i=1;i<pts.length;i++){ const [x0,y0]=pts[i-1]; const [x1,y1]=pts[i]; auc+=(x1-x0)*(y0+y1)/2; } return {fpr:pts.map(p=>p[0]), tpr:pts.map(p=>p[1]), auc}; }
-function renderKeyVals(el,obj){ el.innerHTML=Object.entries(obj).map(([k,v])=>`<div>${k}: <strong>${typeof v==='number'?v.toFixed(4):v}</strong></div>`).join(''); }
-
-// ---------- Schema ----------
-const TARGET='Survived';
-const ID_COL='PassengerId';
-const FEATURE_COLS=['Pclass','Sex','Age','SibSp','Parch','Fare','Embarked'];
-const ONEHOT_CATS={ Sex:['male','female'], Pclass:['1','2','3'], Embarked:['C','Q','S'] };
-const NUMERIC_Z=['Age','Fare'];
-
-// ---------- Load & Inspect ----------
-async function handleLoad(){
-  try{
-    const trainText=await readFile(els.trainFile);
-    const testText =await readFile(els.testFile);
-    if(!trainText){ alert('Please choose train.csv'); return; }
-
-    rawTrain=parseCSV(trainText);
-    rawTest = testText? parseCSV(testText) : null;
-
-    renderPreview(els.previewTable, rawTrain);
-    const miss=missingPercent(rawTrain,[TARGET,ID_COL,...FEATURE_COLS]);
-    els.previewMeta.innerHTML=`Train rows: <strong>${rawTrain.length}</strong> · Test rows: <strong>${rawTest?rawTest.length:0}</strong><br><span class="muted">Missing% → ${Object.entries(miss).map(([k,v])=>`${k}:${v.toFixed(1)}%`).join(' · ')}</span>`;
-    els.loadInfo.textContent='Loaded. Next: Preprocessing → Build → Train.';
-
-    renderSurvivalBars(rawTrain);
-  }catch(e){ console.error(e); alert('Failed to load CSV.'); }
-}
-function renderSurvivalBars(rows){
-  const bySex={}, byClass={};
-  for(const r of rows){
-    const s=r.Sex, p=r.Pclass, y=Number(r.Survived);
-    if(s!=null){ bySex[s]??={surv:0,total:0}; bySex[s].total++; if(y===1) bySex[s].surv++; }
-    if(p!=null){ byClass[p]??={surv:0,total:0}; byClass[p].total++; if(y===1) byClass[p].surv++; }
-  }
-  const sexData=Object.entries(bySex).map(([k,v])=>({name:k,value:v.total? v.surv/v.total : 0}));
-  const pclassData=Object.entries(byClass).map(([k,v])=>({name:`P${k}`,value:v.total? v.surv/v.total : 0}));
-  tfvis.render.barchart(els.visSex, sexData, {yLabel:'Survival Rate', xLabel:'Sex', width:420, height:240});
-  tfvis.render.barchart(els.visPclass, pclassData, {yLabel:'Survival Rate', xLabel:'Pclass', width:420, height:240});
+    
+    // Display stats
+    const statsTable = createTable(
+        ['Feature', 'Missing', 'Missing %', 'Unique Values'],
+        Object.entries(stats).map(([feature, stat]) => 
+            [feature, stat.missing, stat.missingPercent + '%', stat.unique])
+    );
+    
+    document.getElementById('data-preview').appendChild(statsTable);
+    
+    // Create survival charts
+    createSurvivalCharts(data);
 }
 
-// ---------- Preprocessing ----------
-function preprocessRows(rows, fitStats=null, isTrain=true, useFamilyLocal=true){
-  if(isTrain){
-    medians.Age=median(rows.map(r=>Number(r.Age)));
-    medians.Fare=median(rows.map(r=>Number(r.Fare)));
-    modes.Embarked=mode(rows.map(r=>r.Embarked));
-  }
-  const ageMed=medians.Age??28, fareMed=medians.Fare??14.45, embMode=modes.Embarked??'S';
+function createSurvivalCharts(data) {
+    const survivalBySex = {};
+    const survivalByPclass = {};
+    
+    data.forEach(passenger => {
+        const survived = parseInt(passenger.Survived);
+        const sex = passenger.Sex;
+        const pclass = passenger.Pclass;
+        
+        if (!isNaN(survived)) {
+            // Sex analysis
+            if (!survivalBySex[sex]) survivalBySex[sex] = { survived: 0, total: 0 };
+            survivalBySex[sex].total++;
+            if (survived === 1) survivalBySex[sex].survived++;
+            
+            // Pclass analysis
+            if (!survivalByPclass[pclass]) survivalByPclass[pclass] = { survived: 0, total: 0 };
+            survivalByPclass[pclass].total++;
+            if (survived === 1) survivalByPclass[pclass].survived++;
+        }
+    });
+    
+    // Create charts using tfjs-vis
+    const sexData = {
+        values: Object.entries(survivalBySex).map(([sex, stats]) => ({
+            sex: sex,
+            survival_rate: (stats.survived / stats.total) * 100
+        }))
+    };
+    
+    const pclassData = {
+        values: Object.entries(survivalByPclass).map(([pclass, stats]) => ({
+            pclass: `Class ${pclass}`,
+            survival_rate: (stats.survived / stats.total) * 100
+        }))
+    };
+    
+    tfvis.render.barchart(
+        { name: 'Survival Rate by Sex', tab: 'Data Analysis' },
+        sexData,
+        { xLabel: 'Sex', yLabel: 'Survival Rate %' }
+    );
+    
+    tfvis.render.barchart(
+        { name: 'Survival Rate by Passenger Class', tab: 'Data Analysis' },
+        pclassData,
+        { xLabel: 'Passenger Class', yLabel: 'Survival Rate %' }
+    );
+}
 
-  const clean=rows.map(r=>{
-    const o={...r};
-    if(o.Age==null) o.Age=ageMed;
-    if(o.Fare==null) o.Fare=fareMed;
-    if(!o.Embarked) o.Embarked=embMode;
-    return o;
-  });
-
-  let zStats=fitStats;
-  if(isTrain){
-    zStats={};
-    for(const c of NUMERIC_Z){ zStats[c]=meanStd(clean.map(r=>Number(r[c]))); }
-  }
-  for(const r of clean){
-    for(const c of NUMERIC_Z){ const v=Number(r[c]); r[c]=(v-zStats[c].mean)/zStats[c].std; }
-  }
-
-  const featCols=[...FEATURE_COLS];
-  if(useFamilyLocal){
-    for(const r of clean){ const f=(r.SibSp||0)+(r.Parch||0)+1; r.FamilySize=f; r.IsAlone=(f===1)?1:0; }
-    featCols.push('FamilySize','IsAlone');
-  }
-
-  featureNames=[];
-  for(const c of featCols){
-    if(ONEHOT_CATS[c]) for(const k of ONEHOT_CATS[c]) featureNames.push(`${c}_${k}`);
-    else featureNames.push(c);
-  }
-
-  const Xarr=[], yarr=[];
-  for(const r of clean){
-    const vec=[];
-    for(const c of featCols){
-      if(ONEHOT_CATS[c]){
-        const raw = r[c]==null ? '' : String(r[c]);
-        vec.push(...oneHot(raw, ONEHOT_CATS[c]));
-      } else vec.push(Number(r[c]));
+// Preprocessing
+elements.preprocessBtn.addEventListener('click', () => {
+    if (!trainData) {
+        alert('Please load data first');
+        return;
     }
-    Xarr.push(vec);
-    if(r[TARGET]!=null) yarr.push(Number(r[TARGET]));
-  }
-  return { Xt: tf.tensor2d(Xarr), yt: yarr.length? tf.tensor1d(yarr,'int32'): null, zStats };
+    
+    try {
+        preprocessData();
+    } catch (error) {
+        alert('Error in preprocessing: ' + error.message);
+        console.error(error);
+    }
+});
+
+function preprocessData() {
+    const outputDiv = document.getElementById('preprocess-output');
+    outputDiv.innerHTML = '<h3>Preprocessing Steps:</h3>';
+    
+    // Schema definition - CHANGE THESE if your dataset has different columns
+    const featureColumns = ['Pclass', 'Sex', 'Age', 'SibSp', 'Parch', 'Fare', 'Embarked'];
+    const targetColumn = 'Survived';
+    const idColumn = 'PassengerId';
+    
+    let steps = [];
+    
+    // Step 1: Handle missing values
+    steps.push('1. Handling missing values:');
+    
+    // Age - impute with median
+    const ages = trainData.map(p => parseFloat(p.Age)).filter(age => !isNaN(age));
+    const ageMedian = ages.length > 0 ? ages.reduce((a, b) => a + b) / ages.length : 30;
+    steps.push(`   - Age: imputed ${trainData.filter(p => !p.Age || p.Age === '').length} missing values with median (${ageMedian.toFixed(1)})`);
+    
+    // Embarked - impute with mode
+    const embarkedCounts = {};
+    trainData.forEach(p => {
+        if (p.Embarked && p.Embarked !== '') {
+            embarkedCounts[p.Embarked] = (embarkedCounts[p.Embarked] || 0) + 1;
+        }
+    });
+    const embarkedMode = Object.keys(embarkedCounts).reduce((a, b) => 
+        embarkedCounts[a] > embarkedCounts[b] ? a : b, 'S');
+    steps.push(`   - Embarked: imputed ${trainData.filter(p => !p.Embarked || p.Embarked === '').length} missing values with mode (${embarkedMode})`);
+    
+    // Fare - impute with median
+    const fares = trainData.map(p => parseFloat(p.Fare)).filter(fare => !isNaN(fare));
+    const fareMedian = fares.length > 0 ? fares.reduce((a, b) => a + b) / fares.length : 32;
+    steps.push(`   - Fare: imputed ${trainData.filter(p => !p.Fare || p.Fare === '').length} missing values with median (${fareMedian.toFixed(2)})`);
+    
+    // Step 2: Create new features (optional) - COMMENT OUT if you don't want these features
+    steps.push('2. Creating new features:');
+    steps.push('   - FamilySize = SibSp + Parch + 1');
+    steps.push('   - IsAlone = 1 if FamilySize == 1, else 0');
+    
+    // Step 3: Prepare features and labels
+    steps.push('3. Preparing features and labels:');
+    
+    const processedData = trainData.map(passenger => {
+        const processed = {};
+        
+        // Handle missing values
+        processed.Age = passenger.Age && passenger.Age !== '' ? 
+            parseFloat(passenger.Age) : ageMedian;
+        processed.Embarked = passenger.Embarked && passenger.Embarked !== '' ? 
+            passenger.Embarked : embarkedMode;
+        processed.Fare = passenger.Fare && passenger.Fare !== '' ? 
+            parseFloat(passenger.Fare) : fareMedian;
+        
+        // Copy other features
+        processed.Pclass = parseInt(passenger.Pclass);
+        processed.Sex = passenger.Sex;
+        processed.SibSp = parseInt(passenger.SibSp);
+        processed.Parch = parseInt(passenger.Parch);
+        
+        // New features - COMMENT OUT THE NEXT 2 LINES if you don't want these features
+        processed.FamilySize = processed.SibSp + processed.Parch + 1;
+        processed.IsAlone = processed.FamilySize === 1 ? 1 : 0;
+        
+        // Target
+        processed.Survived = passenger.Survived !== '' ? 
+            parseInt(passenger.Survived) : null;
+        
+        return processed;
+    }).filter(p => p.Survived !== null); // Remove rows with missing target
+    
+    steps.push(`   - Final training samples: ${processedData.length}`);
+    
+    // Step 4: Calculate standardization parameters
+    // Update this array based on which features you include
+    const numericFeatures = ['Age', 'Fare']; // Remove 'FamilySize' if not using it
+    const standardizationParams = {};
+    
+    numericFeatures.forEach(feature => {
+        const values = processedData.map(p => p[feature]);
+        standardizationParams[feature] = {
+            mean: values.reduce((a, b) => a + b) / values.length,
+            std: Math.sqrt(values.map(x => Math.pow(x - values.reduce((a, b) => a + b) / values.length, 2))
+                .reduce((a, b) => a + b) / values.length)
+        };
+    });
+    
+    steps.push('4. Standardization parameters calculated');
+    
+    // Step 5: One-hot encoding mapping
+    const categoricalFeatures = {
+        Sex: ['male', 'female'],
+        Pclass: ['1', '2', '3'],
+        Embarked: ['C', 'Q', 'S']
+    };
+    
+    steps.push('5. One-hot encoding prepared for: Sex, Pclass, Embarked');
+    
+    // Store preprocessing parameters for later use
+    window.preprocessingParams = {
+        ageMedian,
+        embarkedMode,
+        fareMedian,
+        standardizationParams,
+        categoricalFeatures,
+        useFamilyFeatures: true // Set to false if not using FamilySize and IsAlone
+    };
+    
+    window.processedTrainData = processedData;
+    
+    // Display steps
+    steps.forEach(step => {
+        const p = document.createElement('p');
+        p.style.margin = '5px 0';
+        p.textContent = step;
+        outputDiv.appendChild(p);
+    });
+    
+    outputDiv.innerHTML += `<p><strong>Preprocessing completed! Ready for model building.</strong></p>`;
 }
-function stratifiedSplit(Xt, yt, testSize=0.2){
-  const yData=Array.from(yt.dataSync()); const idx0=[], idx1=[];
-  yData.forEach((v,i)=> (v===1?idx1:idx0).push(i));
-  function take(idxs){ const n=idxs.length, nTest=Math.max(1,Math.round(n*testSize)); const sh=idxs.slice().sort(()=>Math.random()-0.5); return {test:sh.slice(0,nTest), train:sh.slice(nTest)}; }
-  const s0=take(idx0), s1=take(idx1); const trainIdx=s0.train.concat(s1.train), testIdx=s0.test.concat(s1.test);
-  const gather=(t,indices)=>tf.tidy(()=>tf.gather(t, tf.tensor1d(indices,'int32')));
-  return { X_train:gather(Xt,trainIdx), y_train:gather(yt,trainIdx), X_val:gather(Xt,testIdx), y_val:gather(yt,testIdx) };
+
+// Model Building
+elements.buildModelBtn.addEventListener('click', () => {
+    if (!window.processedTrainData) {
+        alert('Please preprocess data first');
+        return;
+    }
+    
+    try {
+        buildModel();
+    } catch (error) {
+        alert('Error building model: ' + error.message);
+        console.error(error);
+    }
+});
+
+function buildModel() {
+    const summaryDiv = document.getElementById('model-summary');
+    summaryDiv.innerHTML = '<h3>Model Architecture:</h3>';
+    
+    // Calculate input shape based on features used
+    // Base features: Pclass(3) + Sex(2) + Age(1) + SibSp(1) + Parch(1) + Fare(1) + Embarked(3) = 12
+    let inputShape = 12;
+    
+    // Add FamilySize and IsAlone if used (2 more features)
+    if (window.preprocessingParams.useFamilyFeatures) {
+        inputShape += 2; // Total becomes 14
+    }
+    
+    // Create sequential model
+    model = tf.sequential();
+    
+    // Add layers with correct input shape
+    model.add(tf.layers.dense({
+        units: 16,
+        activation: 'relu',
+        inputShape: [inputShape]
+    }));
+    
+    model.add(tf.layers.dense({
+        units: 1,
+        activation: 'sigmoid'
+    }));
+    
+    // Compile model
+    model.compile({
+        optimizer: 'adam',
+        loss: 'binaryCrossentropy',
+        metrics: ['accuracy']
+    });
+    
+    // Display model summary
+    const modelSummary = [];
+    model.summary(1, 1, line => modelSummary.push(line));
+    
+    const pre = document.createElement('pre');
+    pre.style.background = '#f5f5f5';
+    pre.style.padding = '10px';
+    pre.textContent = modelSummary.join('\n');
+    summaryDiv.appendChild(pre);
+    
+    summaryDiv.innerHTML += `<p><strong>Input shape: [${inputShape}] - Adjust if you change feature selection</strong></p>`;
 }
 
-// ---------- Model ----------
-function buildModel(inputDim){
-  const m=tf.sequential();
-  m.add(tf.layers.dense({units:16,activation:'relu',inputShape:[inputDim]}));
-  m.add(tf.layers.dense({units:1,activation:'sigmoid'}));
-  m.compile({optimizer:'adam', loss:'binaryCrossentropy', metrics:['accuracy']});
-  return m;
+// Training
+elements.trainBtn.addEventListener('click', async () => {
+    if (!model || !window.processedTrainData) {
+        alert('Please build model and preprocess data first');
+        return;
+    }
+    
+    try {
+        await trainModel();
+    } catch (error) {
+        alert('Error training model: ' + error.message);
+        console.error(error);
+    }
+});
+
+async function trainModel() {
+    const progressDiv = document.getElementById('training-progress');
+    progressDiv.innerHTML = '<h3>Training in progress...</h3>';
+    
+    // Prepare features and labels
+    const { features, labels } = prepareFeaturesAndLabels(window.processedTrainData);
+    
+    // Create 80/20 stratified split
+    const splitIndex = Math.floor(features.shape[0] * 0.8);
+    
+    const trainFeatures = features.slice(0, splitIndex);
+    const trainLabels = labels.slice(0, splitIndex);
+    const valFeatures = features.slice(splitIndex);
+    const valLabels = labels.slice(splitIndex);
+    
+    validationData = [valFeatures, valLabels];
+    
+    // Training callbacks
+    const callbacks = {
+        onEpochEnd: (epoch, logs) => {
+            progressDiv.innerHTML = `
+                <h3>Training Progress</h3>
+                <p>Epoch ${epoch + 1}/50</p>
+                <p>Loss: ${logs.loss.toFixed(4)}, Accuracy: ${logs.acc.toFixed(4)}</p>
+                <p>Val Loss: ${logs.val_loss.toFixed(4)}, Val Accuracy: ${logs.val_acc.toFixed(4)}</p>
+            `;
+            
+            // Update tfjs-vis charts
+            tfvis.show.history({ name: 'Training History', tab: 'Training' }, 
+                [{ epoch: epoch + 1, loss: logs.loss, val_loss: logs.val_loss, 
+                   acc: logs.acc, val_acc: logs.val_acc }], 
+                ['loss', 'val_loss', 'acc', 'val_acc']);
+        }
+    };
+    
+    // Train model
+    trainingHistory = await model.fit(trainFeatures, trainLabels, {
+        epochs: 50,
+        batchSize: 32,
+        validationData: validationData,
+        callbacks: callbacks,
+        verbose: 0
+    });
+    
+    progressDiv.innerHTML += '<p><strong>Training completed!</strong></p>';
+    
+    // Calculate and display metrics
+    calculateMetrics();
 }
 
-// ---------- Events ----------
-els.btnLoad.addEventListener('click', handleLoad);
-
-els.btnPreprocess.addEventListener('click', ()=>{
-  if(!rawTrain){ alert('Load train.csv first.'); return; }
-  useFamily = !!els.toggleFamily.checked;
-  const {Xt, yt, zStats} = preprocessRows(rawTrain, null, true, useFamily);
-  X?.dispose(); y?.dispose(); X=Xt; y=yt; scalers=zStats;
-  els.prepInfo.innerHTML=`Features: <strong>${featureNames.join(', ')}</strong><br/>X: <strong>${X.shape.join('×')}</strong>, y: <strong>${y.shape[0]}</strong>`;
-});
-
-els.btnBuild.addEventListener('click', ()=>{
-  if(!X||!y){ alert('Run Preprocessing first.'); return; }
-  model?.dispose(); model=buildModel(X.shape[1]);
-  tfvis.show.modelSummary(els.visModel, model);
-  const lines=[]; model.summary(80,undefined,l=>lines.push(l));
-  els.modelSummary.innerHTML=`<pre style="white-space:pre-wrap;">${lines.join('\n')}</pre>`;
-});
-
-els.btnTrain.addEventListener('click', async ()=>{
-  if(!model){ alert('Build model first.'); return; }
-  if(split.X_train){ split.X_train.dispose(); split.y_train.dispose(); split.X_val.dispose(); split.y_val.dispose(); }
-  split = stratifiedSplit(X, y, 0.2);
-
-  const visCb = tfvis.show.fitCallbacks(els.visFit, ['loss','val_loss','acc','val_acc'], {callbacks:['onEpochEnd']});
-  const statusCb = { onEpochEnd:(_,logs)=>{ els.trainInfo.textContent = `loss ${logs.loss.toFixed(4)} | acc ${logs.acc.toFixed(4)} | val_loss ${logs.val_loss.toFixed(4)} | val_acc ${logs.val_acc.toFixed(4)}`; } };
-  const earlyStop = tf.callbacks.earlyStopping({monitor:'val_loss', patience:5, restoreBestWeight:true});
-
-  await model.fit(split.X_train, split.y_train, {
-    epochs:50, batchSize:32, validationData:[split.X_val, split.y_val],
-    callbacks:[visCb, statusCb, earlyStop]    // single callbacks array (no overwrite)
-  });
-  els.trainInfo.textContent += ' — done.';
-});
-
-els.btnEvaluate.addEventListener('click', async ()=>{
-  if(!split.X_val){ alert('Train first.'); return; }
-  const probsT = model.predict(split.X_val);
-  valProbs = Array.from(await probsT.data());  // flattened 1D
-  probsT.dispose();
-  valTrue = Array.from(await split.y_val.data());
-
-  roc = computeROC(valTrue, valProbs);
-  els.aucInfo.innerHTML = `AUC: <strong>${roc.auc.toFixed(4)}</strong>`;
-  const rocPts = roc.fpr.map((x,i)=>({x, y: roc.tpr[i]}));
-  tfvis.render.linechart(els.visROC, {values:rocPts, series:['ROC']}, {xLabel:'FPR', yLabel:'TPR', width:420, height:260});
-
-  threshold = Number(els.thrSlider.value); els.thrVal.textContent = threshold.toFixed(2);
-  updateThresholdStats();
-});
-
-function updateThresholdStats(){
-  if(!valProbs || !valTrue) return;
-  const cm = confusion(valTrue, valProbs, threshold);
-  const m = prf(cm);
-  renderKeyVals(els.cmStats, cm);
-  renderKeyVals(els.prfStats, {Precision:m.precision, Recall:m.recall, F1:m.f1});
-}
-els.btnUpdateThr.addEventListener('click', ()=>{ threshold=Number(els.thrSlider.value); els.thrVal.textContent=threshold.toFixed(2); updateThresholdStats(); });
-els.thrSlider.addEventListener('input', ()=>{ els.thrVal.textContent=Number(els.thrSlider.value).toFixed(2); });
-
-els.btnPredict.addEventListener('click', async ()=>{
-  if(!rawTest){ alert('Upload test.csv first.'); return; }
-  if(!model){ alert('Build & train model first.'); return; }
-  const {Xt} = preprocessRows(rawTest, scalers, false, useFamily);
-  const probsT=model.predict(Xt);
-  const probs=Array.from(await probsT.data());
-  probsT.dispose(); Xt.dispose();
-  testProbs=probs;
-
-  const ids=rawTest.map(r=>Number(r[ID_COL]));
-  submission = ids.map((id,i)=>({PassengerId:id, Survived: probs[i]>=threshold?1:0}));
-  probabilities = ids.map((id,i)=>({PassengerId:id, Probability: probs[i]}));
-  els.predInfo.textContent=`Predicted ${ids.length} rows @ threshold ${threshold.toFixed(2)}.`;
-});
-
-els.btnSaveModel.addEventListener('click', async ()=>{
-  if(!model){ alert('No model.'); return; }
-  await model.save('downloads://titanic-tfjs');
-});
-
-els.btnExportSubmission.addEventListener('click', ()=>{
-  if(!submission){ alert('Run Predict first.'); return; }
-  downloadCSV('submission.csv', submission.map(r=>[r.PassengerId,r.Survived]), ['PassengerId','Survived']);
-});
-els.btnExportProbs.addEventListener('click', ()=>{
-  if(!probabilities){ alert('Run Predict first.'); return; }
-  downloadCSV('probabilities.csv', probabilities.map(r=>[r.PassengerId,r.Probability]), ['PassengerId','Probability']);
-});
-
-// ---------- CSV download helper ----------
-function downloadCSV(filename, rows, header){
-  const lines=[];
-  if(header) lines.push(header.join(','));
-  for(const r of rows){
-    const escaped = r.map(v=>{ const s=String(v??''); return /[",\n]/.test(s)? `"${s.replace(/"/g,'""')}"` : s; });
-    lines.push(escaped.join(','));
-  }
-  const blob=new Blob([lines.join('\n')],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
-  const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); URL.revokeObjectURL(url);
+function prepareFeaturesAndLabels(data) {
+    const params = window.preprocessingParams;
+    const featuresArray = [];
+    const labelsArray = [];
+    
+    data.forEach(passenger => {
+        const featureVector = [];
+        
+        // One-hot encode Pclass
+        const pclassOneHot = [0, 0, 0];
+        pclassOneHot[parseInt(passenger.Pclass) - 1] = 1;
+        featureVector.push(...pclassOneHot);
+        
+        // One-hot encode Sex
+        const sexOneHot = passenger.Sex === 'female' ? [1, 0] : [0, 1];
+        featureVector.push(...sexOneHot);
+        
+        // Standardize Age
+        const standardizedAge = (passenger.Age - params.standardizationParams.Age.mean) / 
+                              params.standardizationParams.Age.std;
+        featureVector.push(standardizedAge);
+        
+        // SibSp (keep as is)
+        featureVector.push(passenger.SibSp);
+        
+        // Parch (keep as is)
+        featureVector.push(passenger.Parch);
+        
+        // Standardize Fare
+        const standardizedFare = (passenger.Fare - params.standardizationParams.Fare.mean) / 
+                               params.standardizationParams.Fare.std;
+        featureVector.push(standardizedFare);
+        
+        // One-hot encode Embarked
+        const embarkedOneHot = [0, 0, 0];
+        const embarkedIndex = ['C', 'Q', 'S'].indexOf(passenger.Embarked);
+        if (embarkedIndex !== -1) embarkedOneHot[embarkedIndex] = 1;
+        featureVector.push(...embarkedOneHot);
+        
+        // Add FamilySize and IsAlone if using them
+        if (params.useFamilyFeatures) {
+            // Standardize FamilySize
+            if (params.standardizationParams.FamilySize) {
+                const standardizedFamilySize = (passenger.FamilySize - params.standardizationParams.FamilySize.mean) / 
+                                            params.standardizationParams.FamilySize.std;
+                featureVector.push(standardizedFamilySize);
+            } else {
+                featureVector.push(passenger.FamilySize); // Use raw value if not standardized
+            }
+            
+            // IsAlone (binary, no standardization needed)
+            featureVector.push(passenger.IsAlone);
+        }
+        
+        featuresArray.push(featureVector);
+        labelsArray.push(passenger.Survived);
+    });
+    
+    return {
+        features: tf.tensor2d(featuresArray),
+        labels: tf.tensor1d(labelsArray)
+    };
 }
 
-// ---------- Cleanup ----------
-window.addEventListener('beforeunload', ()=>{
-  X?.dispose(); y?.dispose();
-  if(split.X_train) split.X_train.dispose();
-  if(split.y_train) split.y_train.dispose();
-  if(split.X_val) split.X_val.dispose();
-  if(split.y_val) split.y_val.dispose();
+// Metrics calculation and display
+function calculateMetrics() {
+    if (!model || !validationData) return;
+    
+    const [valFeatures, valLabels] = validationData;
+    const predictions = model.predict(valFeatures);
+    const probs = predictions.dataSync();
+    const trueLabels = valLabels.dataSync();
+    
+    // Calculate ROC curve data
+    rocData = calculateROCCurve(probs, trueLabels);
+    
+    // Display ROC curve
+    tfvis.render.linechart(
+        { name: 'ROC Curve', tab: 'Evaluation' },
+        { values: rocData.points },
+        { xLabel: 'False Positive Rate', yLabel: 'True Positive Rate' }
+    );
+    
+    // Display AUC
+    const metricsDiv = document.getElementById('performance-metrics');
+    if (metricsDiv) {
+        metricsDiv.innerHTML = `
+            <h3>Model Performance</h3>
+            <p><strong>AUC: ${rocData.auc.toFixed(4)}</strong></p>
+        `;
+    }
+    
+    // Initial metrics with default threshold
+    updateMetrics(0.5);
+}
+
+function calculateROCCurve(probabilities, trueLabels) {
+    const thresholds = Array.from({ length: 100 }, (_, i) => i / 100);
+    const points = [];
+    
+    thresholds.forEach(threshold => {
+        let tp = 0, fp = 0, tn = 0, fn = 0;
+        
+        for (let i = 0; i < probabilities.length; i++) {
+            const prediction = probabilities[i] >= threshold ? 1 : 0;
+            const actual = trueLabels[i];
+            
+            if (prediction === 1 && actual === 1) tp++;
+            else if (prediction === 1 && actual === 0) fp++;
+            else if (prediction === 0 && actual === 0) tn++;
+            else if (prediction === 0 && actual === 1) fn++;
+        }
+        
+        const tpr = tp + fn === 0 ? 0 : tp / (tp + fn);
+        const fpr = fp + tn === 0 ? 0 : fp / (fp + tn);
+        
+        points.push({ x: fpr, y: tpr, threshold });
+    });
+    
+    // Calculate AUC using trapezoidal rule
+    let auc = 0;
+    for (let i = 1; i < points.length; i++) {
+        auc += (points[i].x - points[i-1].x) * (points[i].y + points[i-1].y) / 2;
+    }
+    
+    return { points, auc };
+}
+
+// Threshold slider event
+elements.thresholdSlider.addEventListener('input', (e) => {
+    const threshold = parseFloat(e.target.value);
+    elements.thresholdValue.textContent = threshold.toFixed(2);
+    updateMetrics(threshold);
 });
+
+function updateMetrics(threshold) {
+    if (!rocData || !validationData) return;
+    
+    const [valFeatures, valLabels] = validationData;
+    const predictions = model.predict(valFeatures);
+    const probs = predictions.dataSync();
+    const trueLabels = valLabels.dataSync();
+    
+    let tp = 0, fp = 0, tn = 0, fn = 0;
+    
+    for (let i = 0; i < probs.length; i++) {
+        const prediction = probs[i] >= threshold ? 1 : 0;
+        const actual = trueLabels[i];
+        
+        if (prediction === 1 && actual === 1) tp++;
+        else if (prediction === 1 && actual === 0) fp++;
+        else if (prediction === 0 && actual === 0) tn++;
+        else if (prediction === 0 && actual === 1) fn++;
+    }
+    
+    const accuracy = (tp + tn) / (tp + tn + fp + fn);
+    const precision = tp + fp === 0 ? 0 : tp / (tp + fp);
+    const recall = tp + fn === 0 ? 0 : tp / (tp + fn);
+    const f1 = precision + recall === 0 ? 0 : 2 * (precision * recall) / (precision + recall);
+    
+    // Update confusion matrix
+    const confusionMatrixDiv = document.getElementById('confusion-matrix');
+    if (confusionMatrixDiv) {
+        confusionMatrixDiv.innerHTML = `
+            <h3>Confusion Matrix (Threshold: ${threshold.toFixed(2)})</h3>
+            ${createTable(
+                ['', 'Predicted 0', 'Predicted 1'],
+                [
+                    ['Actual 0', tn, fp],
+                    ['Actual 1', fn, tp]
+                ]
+            ).outerHTML}
+        `;
+    }
+    
+    // Update performance metrics
+    const performanceDiv = document.getElementById('performance-metrics');
+    if (performanceDiv) {
+        // Preserve AUC display
+        const aucDisplay = performanceDiv.querySelector('p') ? performanceDiv.querySelector('p').outerHTML : '';
+        performanceDiv.innerHTML = aucDisplay + `
+            <h3>Performance Metrics</h3>
+            ${createTable(
+                ['Metric', 'Value'],
+                [
+                    ['Accuracy', accuracy.toFixed(4)],
+                    ['Precision', precision.toFixed(4)],
+                    ['Recall', recall.toFixed(4)],
+                    ['F1-Score', f1.toFixed(4)]
+                ]
+            ).outerHTML}
+        `;
+    }
+}
+
+// Prediction and Export
+elements.predictBtn.addEventListener('click', async () => {
+    if (!model || !testData) {
+        alert('Please train model and load test data first');
+        return;
+    }
+    
+    try {
+        await predictTestData();
+    } catch (error) {
+        alert('Error predicting: ' + error.message);
+        console.error(error);
+    }
+});
+
+async function predictTestData() {
+    const resultsDiv = document.getElementById('prediction-results');
+    resultsDiv.innerHTML = '<h3>Generating predictions...</h3>';
+    
+    // Preprocess test data using training parameters
+    const processedTestData = testData.map(passenger => {
+        const processed = {};
+        const params = window.preprocessingParams;
+        
+        // Handle missing values using training parameters
+        processed.Age = passenger.Age && passenger.Age !== '' ? 
+            parseFloat(passenger.Age) : params.ageMedian;
+        processed.Embarked = passenger.Embarked && passenger.Embarked !== '' ? 
+            passenger.Embarked : params.embarkedMode;
+        processed.Fare = passenger.Fare && passenger.Fare !== '' ? 
+            parseFloat(passenger.Fare) : params.fareMedian;
+        
+        // Copy other features
+        processed.Pclass = parseInt(passenger.Pclass);
+        processed.Sex = passenger.Sex;
+        processed.SibSp = parseInt(passenger.SibSp);
+        processed.Parch = parseInt(passenger.Parch);
+        processed.PassengerId = passenger.PassengerId;
+        
+        // New features - only if using them
+        if (params.useFamilyFeatures) {
+            processed.FamilySize = processed.SibSp + processed.Parch + 1;
+            processed.IsAlone = processed.FamilySize === 1 ? 1 : 0;
+        }
+        
+        return processed;
+    });
+    
+    // Prepare features for prediction
+    const testFeaturesArray = processedTestData.map(passenger => {
+        const featureVector = [];
+        const params = window.preprocessingParams;
+        
+        // One-hot encode Pclass
+        const pclassOneHot = [0, 0, 0];
+        pclassOneHot[parseInt(passenger.Pclass) - 1] = 1;
+        featureVector.push(...pclassOneHot);
+        
+        // One-hot encode Sex
+        const sexOneHot = passenger.Sex === 'female' ? [1, 0] : [0, 1];
+        featureVector.push(...sexOneHot);
+        
+        // Standardize Age
+        const standardizedAge = (passenger.Age - params.standardizationParams.Age.mean) / 
+                              params.standardizationParams.Age.std;
+        featureVector.push(standardizedAge);
+        
+        // SibSp
+        featureVector.push(passenger.SibSp);
+        
+        // Parch
+        featureVector.push(passenger.Parch);
+        
+        // Standardize Fare
+        const standardizedFare = (passenger.Fare - params.standardizationParams.Fare.mean) / 
+                               params.standardizationParams.Fare.std;
+        featureVector.push(standardizedFare);
+        
+        // One-hot encode Embarked
+        const embarkedOneHot = [0, 0, 0];
+        const embarkedIndex = ['C', 'Q', 'S'].indexOf(passenger.Embarked);
+        if (embarkedIndex !== -1) embarkedOneHot[embarkedIndex] = 1;
+        featureVector.push(...embarkedOneHot);
+        
+        // Add FamilySize and IsAlone if using them
+        if (params.useFamilyFeatures) {
+            // FamilySize (standardize if parameters exist, otherwise use raw)
+            if (params.standardizationParams.FamilySize) {
+                const standardizedFamilySize = (passenger.FamilySize - params.standardizationParams.FamilySize.mean) / 
+                                            params.standardizationParams.FamilySize.std;
+                featureVector.push(standardizedFamilySize);
+            } else {
+                featureVector.push(passenger.FamilySize);
+            }
+            
+            // IsAlone (binary)
+            featureVector.push(passenger.IsAlone);
+        }
+        
+        return featureVector;
+    });
+    
+    const testFeatures = tf.tensor2d(testFeaturesArray);
+    const predictions = model.predict(testFeatures);
+    testPredictions = predictions.dataSync();
+    
+    // Display sample predictions
+    const samplePredictions = processedTestData.slice(0, 10).map((passenger, i) => [
+        passenger.PassengerId,
+        testPredictions[i].toFixed(4),
+        testPredictions[i] >= 0.5 ? '1' : '0'
+    ]);
+    
+    resultsDiv.innerHTML = `
+        <h3>Test Predictions (First 10)</h3>
+        ${createTable(
+            ['PassengerId', 'Probability', 'Prediction'],
+            samplePredictions
+        ).outerHTML}
+        <p>Total predictions generated: ${testPredictions.length}</p>
+    `;
+}
+
+elements.downloadBtn.addEventListener('click', () => {
+    if (!testPredictions || !testData) {
+        alert('Please generate predictions first');
+        return;
+    }
+    
+    // Create submission CSV
+    let csvContent = 'PassengerId,Survived\n';
+    const threshold = parseFloat(elements.thresholdSlider.value);
+    
+    testData.forEach((passenger, i) => {
+        const prediction = testPredictions[i] >= threshold ? 1 : 0;
+        csvContent += `${passenger.PassengerId},${prediction}\n`;
+    });
+    
+    // Create probabilities CSV
+    let probContent = 'PassengerId,Probability\n';
+    testData.forEach((passenger, i) => {
+        probContent += `${passenger.PassengerId},${testPredictions[i].toFixed(6)}\n`;
+    });
+    
+    // Download files
+    downloadCSV(csvContent, 'submission.csv');
+    downloadCSV(probContent, 'probabilities.csv');
+});
+
+elements.saveModelBtn.addEventListener('click', async () => {
+    if (!model) {
+        alert('Please train model first');
+        return;
+    }
+    
+    try {
+        await model.save('downloads://titanic-model');
+    } catch (error) {
+        alert('Error saving model: ' + error.message);
+        console.error(error);
+    }
+});
+
+// Utility functions
+function createTable(headers, rows) {
+    const table = document.createElement('table');
+    
+    // Create header
+    const thead = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    headers.forEach(header => {
+        const th = document.createElement('th');
+        th.textContent = header;
+        headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+    
+    // Create body
+    const tbody = document.createElement('tbody');
+    rows.forEach(row => {
+        const tr = document.createElement('tr');
+        row.forEach(cell => {
+            const td = document.createElement('td');
+            td.textContent = cell;
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    
+    return table;
+}
+
+function downloadCSV(content, filename) {
+    const blob = new Blob([content], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.setAttribute('hidden', '');
+    a.setAttribute('href', url);
+    a.setAttribute('download', filename);
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
